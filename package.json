@@ -1,0 +1,49 @@
+{
+  "name": "aws-sagemaker-groundtruth-to-azure-customvision",
+  "version": "1.0.0",
+  "main": "dist/index.js",
+  "directories": {
+    "lib": "lib"
+  },
+  "bin": {
+    "aws-sagemaker-groundtruth-to-azure-customvision": "dist/index.js"
+  },
+  "keywords": [
+    "aws",
+    "azure",
+    "custom vision",
+    "sagemaker",
+    "ground truth",
+    "amazon",
+    "microsoft",
+    "image",
+    "ml",
+    "ai",
+    "machine learning",
+    "custom vision",
+    "ground truth",
+    "amazon web services",
+    "cli"
+  ],
+  "author": "rrainn, Inc.",
+  "license": "MIT",
+  "description": "This tool allows you to easily import your AWS SageMaker Ground Truth labels into Azure's Custom Vision for training.",
+  "scripts": {
+    "prepare": "npm run build",
+    "build": "tsc",
+    "build:watch": "npm run build -- --watch"
+  },
+  "dependencies": {
+    "@azure/cognitiveservices-customvision-training": "^5.2.0",
+    "@azure/ms-rest-js": "^2.6.0",
+    "aws-sdk": "^2.1036.0",
+    "cli-progress": "^3.9.1",
+    "inquirer": "^8.2.0"
+  },
+  "devDependencies": {
+    "@types/cli-progress": "^3.9.2",
+    "@types/inquirer": "^8.1.3",
+    "@types/node": "^16.11.10",
+    "typescript": "^4.5.2"
+  }
+}
