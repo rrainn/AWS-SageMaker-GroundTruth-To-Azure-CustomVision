@@ -7,25 +7,49 @@ import * as msRest from "@azure/ms-rest-js";
 import * as TrainingApi from "@azure/cognitiveservices-customvision-training";
 import * as inquirer from "inquirer";
 import * as cliProgress from "cli-progress";
+import * as path from "path";
+import {promises as fs} from "fs";
 const setTimeoutPromise = util.promisify(setTimeout);
 
 (async () => {
-	const {awsRegion} = await inquirer.prompt([
+	const {local, localPath} = await inquirer.prompt([
+		{
+			"type": "list",
+			"name": "local",
+			"message": "Do you want to use local files generated from GroundTruth or call the AWS services directly (remote)?",
+			"choices": [
+				"remote",
+				"local"
+			],
+			"default": "remote"
+		},
 		{
 			"type": "input",
-			"name": "awsRegion",
-			"message": "What AWS Region are you using?",
-			"default": process.env.AWS_REGION || "us-east-1"
+			"name": "localPath",
+			"message": "Enter the path to the local directory containing the GroundTruth files. This should contain the GroundTruth file (output.manifest) and the images.",
+			"when": (answers) => answers.local === "local"
 		}
 	]);
+	let awsRegion;
+	if (local === "remote") {
+		awsRegion = (await inquirer.prompt([
+			{
+				"type": "input",
+				"name": "awsRegion",
+				"message": "What AWS Region are you using?",
+				"default": process.env.AWS_REGION || "us-east-1"
+			}
+		])).awsRegion;
+	}
 	const sageMaker = new SageMaker({"region": awsRegion});
-	const labelingJobs = (await sageMaker.listLabelingJobs().promise()).LabelingJobSummaryList.filter((job) => job.LabelingJobStatus === "Completed");
+	const labelingJobs = local === "remote" ? (await sageMaker.listLabelingJobs().promise()).LabelingJobSummaryList.filter((job) => job.LabelingJobStatus === "Completed") : [];
 	const results = await inquirer.prompt([
 		{
 			"type": "list",
 			"name": "sageMakerLabelingJob",
 			"message": "Which Ground Truth labeling job would you like to use?",
-			"choices": labelingJobs.map((job) => job.LabelingJobName)
+			"choices": labelingJobs.map((job) => job.LabelingJobName),
+			"when": () => local === "remote"
 		},
 		{
 			"type": "input",
@@ -64,7 +88,7 @@ const setTimeoutPromise = util.promisify(setTimeout);
 		}
 	]);
 	const labelingJob = labelingJobs.find((job) => job.LabelingJobName === results.sageMakerLabelingJob);
-	if (!labelingJob) {
+	if (!labelingJob && local === "remote") {
 		throw new Error("Could not find labeling job.");
 	}
 
@@ -73,7 +97,7 @@ const setTimeoutPromise = util.promisify(setTimeout);
 	const s3Client = new S3({
 		"region": awsRegion
 	});
-	const outputDataset = (await s3Client.getObject(s3OutputDatasetObject).promise()).Body.toString().split("\n").filter(Boolean).map((txt) => JSON.parse(txt));
+	const outputDataset = (local === "remote" ? (await s3Client.getObject(s3OutputDatasetObject).promise()).Body.toString() : await fs.readFile(path.join(localPath, "output.manifest"), "utf8")).split("\n").filter(Boolean).map((txt) => JSON.parse(txt));
 	console.log(`Retrieved ${outputDataset.length} items from AWS Ground Truth Manifest...`);
 
 	const publishIterationName: "detectModel" | "classifyModel" = await (async () => {
@@ -200,7 +224,7 @@ const setTimeoutPromise = util.promisify(setTimeout);
 			const outputImageURL = s3uri_to_bucketkey(output["source-ref"]);
 			const outputImageURLParts = outputImageURL.Key.split("/");
 			const imageName = outputImageURLParts[outputImageURLParts.length - 1];
-			const outputImage = (await s3Client.getObject(outputImageURL).promise()).Body as Buffer;
+			const outputImage = local === "remote" ? ((await s3Client.getObject(outputImageURL).promise()).Body as Buffer) : await fs.readFile(path.join(localPath, imageName));
 
 			if (publishIterationNameFriendlyName === "Object Detection") {
 
