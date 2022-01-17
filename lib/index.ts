@@ -7,25 +7,49 @@ import * as msRest from "@azure/ms-rest-js";
 import * as TrainingApi from "@azure/cognitiveservices-customvision-training";
 import * as inquirer from "inquirer";
 import * as cliProgress from "cli-progress";
+import * as path from "path";
+import {promises as fs} from "fs";
 const setTimeoutPromise = util.promisify(setTimeout);
 
 (async () => {
-	const {awsRegion} = await inquirer.prompt([
+	const {local, localPath} = await inquirer.prompt([
+		{
+			"type": "list",
+			"name": "local",
+			"message": "Do you want to use local files generated from GroundTruth or call the AWS services directly (remote)?",
+			"choices": [
+				"remote",
+				"local"
+			],
+			"default": "remote"
+		},
 		{
 			"type": "input",
-			"name": "awsRegion",
-			"message": "What AWS Region are you using?",
-			"default": process.env.AWS_REGION || "us-east-1"
+			"name": "localPath",
+			"message": "Enter the path to the local directory containing the GroundTruth files. This should contain the GroundTruth file (output.manifest) and the images.",
+			"when": (answers) => answers.local === "local"
 		}
 	]);
+	let awsRegion;
+	if (local === "remote") {
+		awsRegion = (await inquirer.prompt([
+			{
+				"type": "input",
+				"name": "awsRegion",
+				"message": "What AWS Region are you using?",
+				"default": process.env.AWS_REGION || "us-east-1"
+			}
+		])).awsRegion;
+	}
 	const sageMaker = new SageMaker({"region": awsRegion});
-	const labelingJobs = (await sageMaker.listLabelingJobs().promise()).LabelingJobSummaryList.filter((job) => job.LabelingJobStatus === "Completed");
+	const labelingJobs = local === "remote" ? (await sageMaker.listLabelingJobs().promise()).LabelingJobSummaryList.filter((job) => job.LabelingJobStatus === "Completed") : [];
 	const results = await inquirer.prompt([
 		{
 			"type": "list",
 			"name": "sageMakerLabelingJob",
 			"message": "Which Ground Truth labeling job would you like to use?",
-			"choices": labelingJobs.map((job) => job.LabelingJobName)
+			"choices": labelingJobs.map((job) => job.LabelingJobName),
+			"when": () => local === "remote"
 		},
 		{
 			"type": "input",
@@ -64,20 +88,29 @@ const setTimeoutPromise = util.promisify(setTimeout);
 		}
 	]);
 	const labelingJob = labelingJobs.find((job) => job.LabelingJobName === results.sageMakerLabelingJob);
-	if (!labelingJob) {
+	if (!labelingJob && local === "remote") {
 		throw new Error("Could not find labeling job.");
 	}
 
 	console.log("Retrieving AWS Ground Truth Manifest...");
-	const s3OutputDatasetObject = s3uri_to_bucketkey(labelingJob.LabelingJobOutput.OutputDatasetS3Uri);
+	const s3OutputDatasetObject = local === "remote" ? s3uri_to_bucketkey(labelingJob.LabelingJobOutput.OutputDatasetS3Uri) : undefined;
 	const s3Client = new S3({
 		"region": awsRegion
 	});
-	const outputDataset = (await s3Client.getObject(s3OutputDatasetObject).promise()).Body.toString().split("\n").filter(Boolean).map((txt) => JSON.parse(txt));
+	const outputDataset = (local === "remote" ? (await s3Client.getObject(s3OutputDatasetObject).promise()).Body.toString() : await fs.readFile(path.join(localPath, "output.manifest"), "utf8")).split("\n").filter(Boolean).map((txt) => JSON.parse(txt));
 	console.log(`Retrieved ${outputDataset.length} items from AWS Ground Truth Manifest...`);
 
+	const defaultLabelingJobName = local === "remote" ? labelingJob.LabelingJobName : Object.keys(outputDataset[0]).find((key) => key !== "source-ref" && !key.endsWith("-metadata"));
+	const labelingJobName = local === "remote" ? defaultLabelingJobName : ((await inquirer.prompt([
+		{
+			"type": "input",
+			"name": "labelingJobName",
+			"message": "What is the name of your labeling job?",
+			"default": defaultLabelingJobName
+		}
+	])).labelingJobName);
 	const publishIterationName: "detectModel" | "classifyModel" = await (async () => {
-		const typesArray = outputDataset.map((item) => item[`${labelingJob.LabelingJobName}-metadata`].type);
+		const typesArray = outputDataset.map((item) => item[`${labelingJobName}-metadata`].type);
 		const isEveryTypeIdentical = typesArray.every((type, i, array) => type === array[0]);
 		if (!isEveryTypeIdentical) {
 			throw new Error("Multiple types not supported.");
@@ -152,7 +185,7 @@ const setTimeoutPromise = util.promisify(setTimeout);
 			"name": "newProjectName",
 			"message": "What should the name of your new project be?",
 			"when": (answers) => answers.shouldUseExistingProject === "No",
-			"default": labelingJob.LabelingJobName
+			"default": labelingJobName
 		},
 		{
 			"type": "list",
@@ -167,7 +200,7 @@ const setTimeoutPromise = util.promisify(setTimeout);
 			"message": "What project would you like to use?",
 			"choices": existingProjectChoices,
 			"when": (answers) => answers.shouldUseExistingProject === "Yes",
-			"default": existingProjectChoices.includes(labelingJob.LabelingJobName) ? labelingJob.LabelingJobName : existingProjectChoices[0]
+			"default": existingProjectChoices.includes(labelingJobName) ? labelingJobName : existingProjectChoices[0]
 		}
 	]));
 	let project: TrainingApi.TrainingAPIModels.Project | TrainingApi.TrainingAPIModels.CreateProjectResponse;
@@ -200,20 +233,20 @@ const setTimeoutPromise = util.promisify(setTimeout);
 			const outputImageURL = s3uri_to_bucketkey(output["source-ref"]);
 			const outputImageURLParts = outputImageURL.Key.split("/");
 			const imageName = outputImageURLParts[outputImageURLParts.length - 1];
-			const outputImage = (await s3Client.getObject(outputImageURL).promise()).Body as Buffer;
+			const outputImage = local === "remote" ? ((await s3Client.getObject(outputImageURL).promise()).Body as Buffer) : await fs.readFile(path.join(localPath, imageName));
 
 			if (publishIterationNameFriendlyName === "Object Detection") {
 
-				const annotations: any[] = output[labelingJob.LabelingJobName].annotations;
-				const classMap: {[key: string]: string} = output[`${labelingJob.LabelingJobName}-metadata`]["class-map"];
+				const annotations: any[] = output[labelingJobName].annotations;
+				const classMap: {[key: string]: string} = output[`${labelingJobName}-metadata`]["class-map"];
 
-				const imageSizeObject = output[labelingJob.LabelingJobName]["image_size"];
+				const imageSizeObject = output[labelingJobName]["image_size"];
 				if (imageSizeObject.length !== 1) {
 					throw new Error(`image-size has more than 1 item for ${output["source-ref"]}.`);
 				}
 				const imageSize = imageSizeObject[0];
 				const regions = await Promise.all(annotations.map(async (annotation, index) => {
-					const confidence = output[`${labelingJob.LabelingJobName}-metadata`].objects[index].confidence;
+					const confidence = output[`${labelingJobName}-metadata`].objects[index].confidence;
 					if (confidence < results.confidenceThreshold) {
 						return null;
 					}
@@ -237,14 +270,14 @@ const setTimeoutPromise = util.promisify(setTimeout);
 				return entry;
 			} else if (publishIterationNameFriendlyName === "Classification") {
 				let classMap: {[key: string]: number}; // key as the label name, and number as the confidence level
-				if (output[`${labelingJob.LabelingJobName}-metadata`]["class-name"]) {
+				if (output[`${labelingJobName}-metadata`]["class-name"]) {
 					classMap = {
-						[output[`${labelingJob.LabelingJobName}-metadata`]["class-name"]]: output[`${labelingJob.LabelingJobName}-metadata`].confidence
+						[output[`${labelingJobName}-metadata`]["class-name"]]: output[`${labelingJobName}-metadata`].confidence
 					};
-				} else if (output[`${labelingJob.LabelingJobName}-metadata`]["class-map"]) {
-					classMap = Object.entries(output[`${labelingJob.LabelingJobName}-metadata`]["class-map"]).reduce((obj, classDetails: [string, string]) => {
+				} else if (output[`${labelingJobName}-metadata`]["class-map"]) {
+					classMap = Object.entries(output[`${labelingJobName}-metadata`]["class-map"]).reduce((obj, classDetails: [string, string]) => {
 						const [key, value] = classDetails;
-						obj[value] = output[`${labelingJob.LabelingJobName}-metadata`]["confidence-map"][key];
+						obj[value] = output[`${labelingJobName}-metadata`]["confidence-map"][key];
 						return obj;
 					}, {});
 				}
